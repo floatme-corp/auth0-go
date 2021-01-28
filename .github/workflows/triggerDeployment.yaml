@@ -1,0 +1,87 @@
+name: UploadS3
+on:
+  push:
+    branches:
+      - develop 
+
+jobs:
+  UploadLambdas:
+    name: Upload Lambdas
+    runs-on: ubuntu-latest
+    env:
+      GIT_TERMINAL_PROMPT: 1
+      GOPRIVATE: https://github.com/floatme-corp/*
+      GOSUMDB: off
+    steps:
+      - name: Setup for pulling private github repositories
+        run: |
+          echo "machine github.com login floatmesvc password ${{ secrets.SERVICE_ACCOUNT_TOKEN }}" > $HOME/.netrc
+
+      - name: Checkout Lambdas
+        uses: actions/checkout@v2
+        with:
+          repository: floatme-corp/floatme-lambda
+          ref: master
+          token: ${{ secrets.SERVICE_ACCOUNT_TOKEN }}
+          path: floatme-lambda-pending
+
+      - name: Run script file
+        run: |
+          for f in floatme-lambda-pending/**/*
+          do
+            if [[ !(-d $f) || ($f =~ "Deprecated") ]];  then
+              echo "Ignoring $f"
+            else
+              echo "Building $f"
+              cur_dir=$(pwd)
+              cd $f
+              env GOOS=linux GOARCH=amd64 go build -o main .
+              zip -j ./main.zip main
+              cd $cur_dir
+            fi
+          done
+          cd floatme-lambda-pending/auth
+          env GOOS=linux GOARCH=amd64 go build -o main .
+          zip -j ./main.zip main
+          cd ../..
+        shell: bash
+
+      - uses: jakejarvis/s3-sync-action@master
+        with:
+          args: --follow-symlinks --exclude 'floatme-lambda-pending/.git/*' --exclude 'floatme-lambda-pending/.github/*' --exclude 'floatme-lambda-pending/.gitignore' --exclude 'floatme-lambda-pending/.idea/*' --exclude 'floatme-lambda-pending/Deprecated/*' --exclude 'floatme-lambda-pending/go.mod', --exclude 'floatme-lambda-pending/go.sum' --exclude 'floatme-lambda-pending/README.md'
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: 'us-west-2'
+          DEST_DIR: 'lambda'
+
+  TriggerPipeline:
+    name: Kick off CodePipeline
+    runs-on: ubuntu-latest
+    needs: UploadLambdas
+    steps:
+      - uses: actions/checkout@v2
+      - name: Checkout IaC
+        uses: actions/checkout@v2
+        with:
+          repository: floatme-corp/FloatMeIaC
+          ref: master
+          token: ${{ secrets.SERVICE_ACCOUNT_TOKEN }}
+          path: floatme-iac
+
+      - name: Run script file
+        run: |
+          cd floatme-iac
+          zip -r ../floatme-iac.zip *
+          cd ..
+        shell: bash
+
+      - name: Upload binary to S3 bucket
+        uses: tpaschalis/s3-sync-action@master
+        env:
+          FILE: ./floatme-iac.zip
+          AWS_REGION: 'us-west-2'
+          AWS_S3_BUCKET: ${{ secrets.AWS_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
